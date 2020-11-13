@@ -713,26 +713,26 @@ iface_ping_recv(int fd, short events, void *arg)
 	if (rv == -1)
 		lwarn("%s ping recv", iface->if_name);
 
-	hlen = sizeof(*ip);
-	if (rv < hlen) {
+	iphlen = sizeof(*ip);
+	if (rv < iphlen) {
 		/* iface->if_ping_ip_short++ */
 		return;
 	}
 
 	ip = (struct ip *)bytes;
 	iphlen = ip->ip_hl << 2;
-	if (rv < hlen) {
+	if (rv < iphlen) {
 		/* iface->if_ping_ip_short++ */
 		return;
 	}
 
-	ping = (struct ping_hdr *)(bytes + iphlen);
 	hlen = iphlen + sizeof(*ping);
 	if (rv < hlen) {
 		/* iface->if_ping_short++ */
 		return;
 	}
 
+	ping = (struct ping_hdr *)(bytes + iphlen);
 	if (ping->ping_type != ICMP_ECHOREPLY)
 		return;
 	if (ping->ping_id != iface->if_ca->ca_ping_ident)
@@ -742,13 +742,13 @@ iface_ping_recv(int fd, short events, void *arg)
 		return;
 	}
 
-	arp = (struct ether_arp *)(bytes + hlen);
 	hlen += sizeof(*arp);
 	if (rv < hlen) {
 		/* iface->if_ping_arp_short++ */
 		return;
 	}
 
+	arp = (struct ether_arp *)(bytes + hlen);
 	iface_arp_reply(iface, arp);
 }
 
