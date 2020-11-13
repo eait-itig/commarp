@@ -17,7 +17,7 @@
  */
 
 /*
- * This code was written by Alex Wilson <alex@uq.edu.au> and David
+ * This code was developed by Alex Wilson <alex@uq.edu.au> and David
  * Gwynne <dlg@uq.edu.au> as part of the Information Technology
  * Infrastructure Group for the Faculty of Engineering, Architecture
  * and Information Technology.
@@ -285,7 +285,7 @@ commarp_siginfo(int sig, short events, void *arg)
 	}
 }
 
-#if 1
+#if 0
 static void
 hexdump(const void *d, size_t datalen)
 {
@@ -554,8 +554,6 @@ arp_pkt_input(struct iface *iface, void *pkt, size_t len)
 	sin.sin_len = sizeof(sin);
 	memcpy(&sin.sin_addr, arp->arp_tpa, sizeof(sin.sin_addr));
 
-	linfo("%s %s", iface->if_name, inet_ntoa(sin.sin_addr));
-
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_name = &sin;
 	msg.msg_namelen = sizeof(sin);
@@ -744,8 +742,6 @@ iface_ping_recv(int fd, short events, void *arg)
 		return;
 	}
 
-	linfo("%s %s %s", iface->if_name, __func__, inet_ntoa(sin.sin_addr));
-
 	arp = (struct ether_arp *)(bytes + hlen);
 	hlen += sizeof(*arp);
 	if (rv < hlen) {
@@ -754,7 +750,6 @@ iface_ping_recv(int fd, short events, void *arg)
 	}
 
 	iface_arp_reply(iface, arp);
-	hexdump(arp, sizeof(*arp));
 }
 
 static uint32_t
