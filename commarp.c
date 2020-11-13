@@ -701,10 +701,10 @@ iface_ping_recv(int fd, short events, void *arg)
 	struct sockaddr_in sin;
 	socklen_t sinlen = sizeof(sin);
 	struct iface *iface = arg;
-	uint8_t bytes[1024]; /* XXX */
 	struct ip *ip;
 	struct ping_hdr *ping;
 	struct ether_arp *arp;
+	uint8_t bytes[(0xf << 2) + sizeof(*ping) + sizeof(*arp)];
 	unsigned int iphlen;
 	ssize_t rv, hlen;
 
