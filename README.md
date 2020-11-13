@@ -1,4 +1,4 @@
-# `commarp`
+# commarp(8)
 
 An ARP responder for routers/firewalls on community ports in a
 private VLAN (PVLAN) or WiFi environment configured to provide
