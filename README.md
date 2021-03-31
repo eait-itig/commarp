@@ -14,5 +14,4 @@ This has been written to run on OpenBSD.
 
 ## Todo
 
-- Allow for the specification of which IPs to respond on behalf of
 - Strengthen the ICMP payload
