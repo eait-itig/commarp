@@ -63,9 +63,11 @@
 #include <assert.h>
 #include <stddef.h>
 
+#include "commarp.h"
 #include "log.h"
 
 #define COMMARP_USER	"_commarp"
+#define COMMARP_CONF	"/etc/commarp.conf"
 
 struct ether_arp_pkt {
 	struct ether_header		eap_ether;
@@ -98,12 +100,15 @@ struct ping_hdr {
 
 struct commarp;
 
-struct iface {
+struct commarp_iface {
 	struct commarp		*if_ca;
 	unsigned int		 if_index;
 	char			 if_name[IF_NAMESIZE];
 	struct ether_addr	 if_etheraddr;
 	struct sockaddr_in	 if_addr;
+
+	struct commarp_address_filter *
+				 if_filters;
 
 	struct event		 if_bpf_ev;
 	uint8_t			*if_bpf_buf;
@@ -113,7 +118,8 @@ struct iface {
 	struct event		 if_ping_ev;
 	uint16_t		 if_ping_seq;
 
-	TAILQ_ENTRY(iface)	 if_entry;
+	TAILQ_ENTRY(commarp_iface)
+				 if_entry;
 
 	uint64_t		 if_bpf_reads;
 	uint64_t		 if_packets;
@@ -123,12 +129,11 @@ struct iface {
 
 	uint64_t		 if_bpf_fail;
 	uint64_t		 if_arp_inval;
+	uint64_t		 if_arp_filtered;
 };
 
-TAILQ_HEAD(ifaces, iface);
-
 struct commarp {
-	struct ifaces		 ca_ifaces;
+	struct commarp_ifaces	 ca_ifaces;
 	struct event		 ca_siginfo;
 
 	uint16_t		 ca_ping_ident;
@@ -137,10 +142,10 @@ struct commarp {
 __dead void	 usage(void);
 int		 rdaemon(int);
 
-static void	 ifaces_get(struct commarp *, int, char **);
-static void	 iface_bpf_open(struct iface *);
+static void	 ifaces_get(struct commarp *, char *);
+static void	 iface_bpf_open(struct commarp_iface *);
 static void	 iface_bpf_read(int, short, void *);
-static void	 iface_ping_open(struct iface *, int);
+static void	 iface_ping_open(struct commarp_iface *, int);
 static void	 iface_ping_recv(int, short, void *);
 
 static void	 commarp_siginfo(int, short, void *);
@@ -153,7 +158,7 @@ usage(void)
 {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-dv] [-u user] ifX...\n",
+	fprintf(stderr, "usage: %s [-dv] [-f file] [-u user]\n",
 	    __progname);
 
 	exit(1);
@@ -168,9 +173,10 @@ main(int argc, char *argv[])
 		.ca_ifaces = TAILQ_HEAD_INITIALIZER(commarp.ca_ifaces),
 	};
 	struct commarp *ca = &commarp;
-	struct iface *iface;
+	struct commarp_iface *iface;
 
 	const char *user = COMMARP_USER;
+	char *filename = COMMARP_CONF;
 
 	int debug = 0;
 	int ch;
@@ -178,10 +184,13 @@ main(int argc, char *argv[])
 	struct passwd *pw;
 	int devnull = -1;
 
-	while ((ch = getopt(argc, argv, "du:v")) != -1) {
+	while ((ch = getopt(argc, argv, "df:u:v")) != -1) {
 		switch (ch) {
 		case 'd':
 			debug = verbose = 1;
+			break;
+		case 'f':
+			filename = optarg;
 			break;
 		case 'u':
 			user = optarg;
@@ -198,7 +207,7 @@ main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
-	if (argc == 0)
+	if (argc != 0)
 		usage();
 
 	if (geteuid() != 0)
@@ -208,9 +217,11 @@ main(int argc, char *argv[])
 	if (pw == NULL)
 		errx(1, "no %s user", user);
 
-	ifaces_get(ca, argc, argv);
+	ifaces_get(ca, filename);
 
 	TAILQ_FOREACH(iface, &ca->ca_ifaces, if_entry) {
+		iface->if_ca = ca;
+
 		iface_bpf_open(iface);
 		iface_ping_open(iface, -1);
 
@@ -274,7 +285,7 @@ void
 commarp_siginfo(int sig, short events, void *arg)
 {
 	struct commarp *ca = arg;
-	struct iface *iface = arg;
+	struct commarp_iface *iface = arg;
 
 	TAILQ_FOREACH(iface, &ca->ca_ifaces, if_entry) {
 		linfo("iface:%s bpf_reads:%llu packets:%llu bpf_short:%llu "
@@ -306,15 +317,16 @@ hexdump(const void *d, size_t datalen)
 }
 #endif
 
-static void
-iface_get(struct commarp *ca, struct ifaddrs *ifas, const char *ifname)
+void
+commarp_iface_get(struct commarp_ifaces *ifaces, struct ifaddrs *ifas,
+    const char *ifname, struct commarp_address_filter *filters)
 {
 	struct ifaddrs *ifa;
 	struct sockaddr_in *sin;
 	struct sockaddr_dl *sdl;
 	struct if_data *ifi;
 
-	struct iface *iface;
+	struct commarp_iface *iface;
 
 	iface = malloc(sizeof(*iface));
 	if (iface == NULL)
@@ -366,25 +378,25 @@ iface_get(struct commarp *ca, struct ifaddrs *ifas, const char *ifname)
 	if (iface->if_addr.sin_family != AF_INET)
 		errx(1, "interface %s: no IP address", ifname);
 
-	iface->if_ca = ca;
 	if (strlcpy(iface->if_name, ifname, sizeof(iface->if_name)) >=
 	    sizeof(iface->if_name))
 		errx(1, "ifname too long");
 
-	TAILQ_INSERT_TAIL(&ca->ca_ifaces, iface, if_entry);
+	iface->if_filters = filters;
+
+	TAILQ_INSERT_TAIL(ifaces, iface, if_entry);
 }
 
 void
-ifaces_get(struct commarp *ca, int argc, char **argv)
+ifaces_get(struct commarp *ca, char *filename)
 {
 	struct ifaddrs *ifas;
-	int i;
 
 	if (getifaddrs(&ifas) == -1)
 		err(1, "getifaddrs");
 
-	for (i = 0; i < argc; i++)
-		iface_get(ca, ifas, argv[i]);
+	if (parse_config(&ca->ca_ifaces, ifas, filename) == -1)
+		exit(1);
 
 	freeifaddrs(ifas);
 }
@@ -421,7 +433,7 @@ ifaces_get(struct commarp *ca, int argc, char **argv)
 };
 
 static void
-iface_bpf_open(struct iface *iface)
+iface_bpf_open(struct commarp_iface *iface)
 {
 	struct ifreq ifr;
 	struct bpf_version v;
@@ -477,13 +489,30 @@ iface_bpf_open(struct iface *iface)
 	iface->if_bpf_cur = 0;
 }
 
+static int
+commarp_filter(const struct commarp_address_filter *filters,
+    struct commarp_address caddr)
+{
+	const struct commarp_address_filter *f;
+
+	for (f = filters; f != NULL; f = f->next) {
+		if (caddr.addr >= f->addresses.min.addr &&
+		    caddr.addr <= f->addresses.max.addr)
+			return (f->filter);
+	}
+
+	return (1);
+}
+
 static void
-arp_pkt_input(struct iface *iface, void *pkt, size_t len)
+arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 {
 	struct ether_arp_pkt *eap;
 	struct ether_arp *arp;
 	struct ping_hdr ping;
 	uint32_t cksum;
+
+	struct commarp_address_filter *filter;
 
 	struct sockaddr_in sin;
 	struct msghdr msg;
@@ -533,7 +562,16 @@ arp_pkt_input(struct iface *iface, void *pkt, size_t len)
 		return;
 	}
 
-	arp = &eap->eap_arp;
+	filter = iface->if_filters;
+	if (filter) {
+		struct commarp_address caddr;
+
+		commarp_bytes_to_address(&caddr, arp->arp_tpa);
+		if (commarp_filter(filter, caddr)) {
+			iface->if_arp_filtered++;
+			return;
+		}
+	}
 
 	memset(&ping, 0, sizeof(ping));
 	ping.ping_type = ICMP_ECHO;
@@ -567,7 +605,7 @@ arp_pkt_input(struct iface *iface, void *pkt, size_t len)
 static void
 iface_bpf_read(int fd, short events, void *arg)
 {
-	struct iface *iface = arg;
+	struct commarp_iface *iface = arg;
 	struct bpf_hdr hdr;
 	size_t len, bpflen;
 	ssize_t rv;
@@ -643,7 +681,7 @@ iface_bpf_read(int fd, short events, void *arg)
 }
 
 static void
-iface_ping_open(struct iface *iface, int ttl)
+iface_ping_open(struct commarp_iface *iface, int ttl)
 {
 	int s;
 
@@ -665,7 +703,7 @@ iface_ping_open(struct iface *iface, int ttl)
 }
 
 static void
-iface_arp_reply(struct iface *iface, const struct ether_arp *req)
+iface_arp_reply(struct commarp_iface *iface, const struct ether_arp *req)
 {
 	struct ether_arp_pkt eap;
 	struct ether_header *eh = &eap.eap_ether;
@@ -700,7 +738,7 @@ iface_ping_recv(int fd, short events, void *arg)
 {
 	struct sockaddr_in sin;
 	socklen_t sinlen = sizeof(sin);
-	struct iface *iface = arg;
+	struct commarp_iface *iface = arg;
 	struct ip *ip;
 	struct ping_hdr *ping;
 	struct ether_arp *arp;
@@ -750,6 +788,22 @@ iface_ping_recv(int fd, short events, void *arg)
 	}
 
 	iface_arp_reply(iface, arp);
+}
+
+void
+commarp_inaddr_to_address(struct commarp_address *caddr,
+    const struct in_addr *iaddr)
+{
+	caddr->addr = ntohl(iaddr->s_addr);
+}
+
+void
+commarp_bytes_to_address(struct commarp_address *caddr, const void *bytes)
+{
+	const uint8_t *baddr = bytes;
+
+	caddr->addr = (uint32_t)baddr[0] << 24 | (uint32_t)baddr[1] << 16 |
+	    (uint32_t)baddr[2] << 8 | (uint32_t)baddr[3] << 0;
 }
 
 static uint32_t
