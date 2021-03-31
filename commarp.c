@@ -742,13 +742,13 @@ iface_ping_recv(int fd, short events, void *arg)
 		return;
 	}
 
+	arp = (struct ether_arp *)(bytes + hlen);
 	hlen += sizeof(*arp);
 	if (rv < hlen) {
 		/* iface->if_ping_arp_short++ */
 		return;
 	}
 
-	arp = (struct ether_arp *)(bytes + hlen);
 	iface_arp_reply(iface, arp);
 }
 
