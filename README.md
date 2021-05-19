@@ -26,7 +26,8 @@ follows:
 5. Router R decapsulates the ARP request from inside the ping reply
    from Host B
 6. Router R generates an ARP reply using it's own Ethernet address
-   as the ARP hardware address to use
+   as the ARP hardware address to use for host B
 7. Router R sends the generated ARP reply to Host A
 
-Subsequent IPv4 communication from host A to host B is sent via router R.
+Subsequent IPv4 communication from host A to host B is sent via
+router R.
