@@ -14,7 +14,9 @@ This has been written to run on OpenBSD.
 
 ## How it works
 
-Host A wishes to communicated with host B on a network with client isolation enabled. Router R running `commarp` as follows:
+Host A wishes to communicate with host B on a network with client
+isolation enabled. Router R running `commarp` supports this as
+follows:
 
 1. Host A broadcasts an ARP request for host B to the network
 2. `commarp` on router A receives the ARP requests
