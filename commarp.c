@@ -63,6 +63,8 @@
 #include <assert.h>
 #include <stddef.h>
 
+#include <openssl/evp.h>
+
 #include "commarp.h"
 #include "log.h"
 
@@ -94,9 +96,37 @@ struct ping_hdr {
 #define nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
 #endif
 
+#define sizeof_member(_t, _m) sizeof(((struct _t *)0)->_m)
+
 #ifndef ISSET
 #define ISSET(_v, _m)	((_v) & (_m))
 #endif
+
+/* commarp uses chacha20-poly1305 */
+
+#define COMMARP_AEAD_OVERHEAD	16
+
+struct commarp_aead_header {
+	uint32_t	gen;
+	uint32_t	nonce[3];
+};
+
+struct commarp_aead_aad {
+	struct in_addr	addr;
+	uint16_t	id;
+	uint16_t	seq;
+};
+
+struct commarp_epoch {
+	TAILQ_ENTRY(commarp_epoch)
+				ce_entry;
+	struct timespec		ce_birth;
+	uint32_t		ce_gen;
+	uint32_t		ce_key[8];
+	uint64_t		ce_nonce;
+};
+
+TAILQ_HEAD(commarp_epochs, commarp_epoch);
 
 struct commarp;
 
@@ -136,6 +166,10 @@ struct commarp {
 	struct commarp_ifaces	 ca_ifaces;
 	struct event		 ca_siginfo;
 
+	const EVP_AEAD		*ca_aead;
+	struct commarp_epochs	 ca_epochs;
+	struct event		 ca_epoch_tick;
+
 	uint16_t		 ca_ping_ident;
 };
 
@@ -148,10 +182,18 @@ static void	 iface_bpf_read(int, short, void *);
 static void	 iface_ping_open(struct commarp_iface *, int);
 static void	 iface_ping_recv(int, short, void *);
 
+static void	 commarp_epoch_tick_ev(int, short, void *);
+
 static void	 commarp_siginfo(int, short, void *);
 
 static uint32_t	 cksum_add(uint32_t, const void *, size_t);
 static uint16_t	 cksum_fini(uint32_t);
+
+static inline void
+commarp_epoch_tick(struct commarp *ca)
+{
+	commarp_epoch_tick_ev(0, 0, ca);
+}
 
 __dead void
 usage(void)
@@ -166,11 +208,18 @@ usage(void)
 
 int verbose = 0;
 
+static const struct timeval commarp_epoch_tv = { 3600, 0 };
+static const struct timespec commarp_epoch_age = { 7201, 0 };
+#define commarp_epoch_maxnonce 0xfffffffffffff
+static const EVP_AEAD *aead;
+static int debug = 0;
+
 int
 main(int argc, char *argv[])
 {
 	struct commarp commarp = {
 		.ca_ifaces = TAILQ_HEAD_INITIALIZER(commarp.ca_ifaces),
+		.ca_epochs = TAILQ_HEAD_INITIALIZER(commarp.ca_epochs),
 	};
 	struct commarp *ca = &commarp;
 	struct commarp_iface *iface;
@@ -178,11 +227,21 @@ main(int argc, char *argv[])
 	const char *user = COMMARP_USER;
 	char *filename = COMMARP_CONF;
 
-	int debug = 0;
 	int ch;
 
 	struct passwd *pw;
 	int devnull = -1;
+
+	aead = EVP_aead_chacha20_poly1305();
+
+	assert(sizeof_member(commarp_epoch, ce_key) ==
+	    EVP_AEAD_key_length(aead));
+	/* avoid reuse */
+	assert(sizeof_member(commarp_epoch, ce_nonce) <=
+	    EVP_AEAD_nonce_length(aead));
+	assert(sizeof_member(commarp_aead_header, nonce) ==
+	    EVP_AEAD_nonce_length(aead));
+	assert(COMMARP_AEAD_OVERHEAD == EVP_AEAD_max_overhead(aead));
 
 	while ((ch = getopt(argc, argv, "df:u:v")) != -1) {
 		switch (ch) {
@@ -276,9 +335,56 @@ main(int argc, char *argv[])
 	signal_set(&ca->ca_siginfo, SIGINFO, commarp_siginfo, ca);
 	signal_add(&ca->ca_siginfo, NULL);
 
+	evtimer_set(&ca->ca_epoch_tick, commarp_epoch_tick_ev, ca);
+	commarp_epoch_tick(ca);
+
 	event_dispatch();
 
 	return (0);
+}
+
+static void
+commarp_epoch_tick_ev(int nil, short events, void *arg)
+{
+	struct commarp *ca = arg;
+	struct commarp_epoch *ce, *oce, *nce;
+	struct timespec deadline;
+	size_t i;
+
+	evtimer_add(&ca->ca_epoch_tick, &commarp_epoch_tv);
+
+	ce = malloc(sizeof(*ce));
+	if (ce == NULL)
+		err(1, "epoch allocation");
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ce->ce_birth) == -1)
+		err(1, "clock get monotonic");
+
+	do {
+		ce->ce_gen = htonl(arc4random());
+		TAILQ_FOREACH(oce, &ca->ca_epochs, ce_entry) {
+			if (oce->ce_gen == ce->ce_gen)
+				break;
+		}
+	} while (oce != NULL);
+
+	for (i = 0; i < nitems(ce->ce_key); i++)
+		ce->ce_key[i] = htole32(arc4random());
+
+	ce->ce_nonce = 0;
+
+	/* reap old epochs */
+	timespecsub(&ce->ce_birth, &commarp_epoch_age, &deadline);
+	TAILQ_FOREACH_SAFE(oce, &ca->ca_epochs, ce_entry, nce) {
+		if (timespeccmp(&oce->ce_birth, &deadline, >=))
+			continue;
+
+		TAILQ_REMOVE(&ca->ca_epochs, oce, ce_entry);
+		free(oce);
+	}
+
+	/* make the new one available */
+	TAILQ_INSERT_HEAD(&ca->ca_epochs, ce, ce_entry);
 }
 
 void
@@ -507,16 +613,24 @@ commarp_filter(const struct commarp_address_filter *filters,
 static void
 arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 {
+	struct commarp *ca = iface->if_ca;
 	struct ether_arp_pkt *eap;
 	struct ether_arp *arp;
 	struct ping_hdr ping;
 	uint32_t cksum;
+	struct commarp_aead_header ah;
+	struct commarp_aead_aad aad;
+	uint8_t out[sizeof(*arp) + COMMARP_AEAD_OVERHEAD];
+	size_t outlen;
+	struct commarp_epoch *ce;
+	EVP_AEAD_CTX ctx;
+	uint64_t nonce;
 
 	struct commarp_address_filter *filter;
 
 	struct sockaddr_in sin;
 	struct msghdr msg;
-	struct iovec iov[2];
+	struct iovec iov[3];
 
 	iface->if_packets++;
 
@@ -573,24 +687,57 @@ arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 		}
 	}
 
+	ce = TAILQ_FIRST(&ca->ca_epochs);
+	if (ce->ce_nonce >= commarp_epoch_maxnonce) {
+		commarp_epoch_tick(ca);
+		ce = TAILQ_FIRST(&ca->ca_epochs);
+	}
+	nonce = ce->ce_nonce++;
+
+	ah.gen = ce->ce_gen;
+	ah.nonce[0] = 0;
+	ah.nonce[1] = htole32(nonce >> 32);
+	ah.nonce[2] = htole32(nonce);
+
+	memcpy(&aad.addr, arp->arp_tpa, sizeof(sin.sin_addr));
+	aad.id = iface->if_ca->ca_ping_ident;
+	aad.seq = htons(iface->if_ping_seq++);
+
+	if (EVP_AEAD_CTX_init(&ctx, aead,
+	    (void *)ce->ce_key, sizeof(ce->ce_key),
+	    COMMARP_AEAD_OVERHEAD, NULL) != 1)
+		lerrx(1, "EVP init error");
+
+	if (EVP_AEAD_CTX_seal(&ctx,
+	    out, &outlen, sizeof(out),
+	    (void *)ah.nonce, sizeof(ah.nonce),
+	    (void *)arp, sizeof(*arp),
+	    (void *)&aad, sizeof(aad)) != 1)
+		lerrx(1, "EVP seal error");
+
+	EVP_AEAD_CTX_cleanup(&ctx);
+
 	memset(&ping, 0, sizeof(ping));
 	ping.ping_type = ICMP_ECHO;
-	ping.ping_seq = htons(iface->if_ping_seq++);
-	ping.ping_id = iface->if_ca->ca_ping_ident;
+	ping.ping_seq = aad.seq;
+	ping.ping_id = aad.id;
 
 	cksum = cksum_add(0, &ping, sizeof(ping));
-	cksum = cksum_add(cksum, arp, sizeof(*arp));
+	cksum = cksum_add(cksum, &ah, sizeof(ah));
+	cksum = cksum_add(cksum, out, outlen);
 	ping.ping_cksum = cksum_fini(cksum);
 
 	iov[0].iov_base = &ping;
 	iov[0].iov_len = sizeof(ping);
-	iov[1].iov_base = arp;
-	iov[1].iov_len = sizeof(*arp);
+	iov[1].iov_base = &ah;
+	iov[1].iov_len = sizeof(ah);
+	iov[2].iov_base = out;
+	iov[2].iov_len = outlen;
 
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
 	sin.sin_len = sizeof(sin);
-	memcpy(&sin.sin_addr, arp->arp_tpa, sizeof(sin.sin_addr));
+	sin.sin_addr = aad.addr;
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_name = &sin;
@@ -598,8 +745,16 @@ arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 	msg.msg_iov = iov;
 	msg.msg_iovlen = nitems(iov);
 
-	if (sendmsg(EVENT_FD(&iface->if_ping_ev), &msg, 0) == -1)
-		lwarn("%s ping", iface->if_name);
+	if (sendmsg(EVENT_FD(&iface->if_ping_ev), &msg, 0) == -1) {
+		switch (errno) {
+		case EHOSTDOWN:
+			/* boring */
+			break;
+		default:
+			lwarn("%s ping", iface->if_name);
+			break;
+		}
+	}
 }
 
 static void
@@ -736,13 +891,21 @@ iface_arp_reply(struct commarp_iface *iface, const struct ether_arp *req)
 static void
 iface_ping_recv(int fd, short events, void *arg)
 {
+	struct commarp_iface *iface = arg;
+	struct commarp *ca = iface->if_ca;
+	struct commarp_epoch *ce;
+
 	struct sockaddr_in sin;
 	socklen_t sinlen = sizeof(sin);
-	struct commarp_iface *iface = arg;
 	struct ip *ip;
 	struct ping_hdr *ping;
-	struct ether_arp *arp;
-	uint8_t bytes[(0xf << 2) + sizeof(*ping) + sizeof(*arp)];
+	struct commarp_aead_header *ah;
+	struct commarp_aead_aad aad;
+	EVP_AEAD_CTX ctx;
+	struct ether_arp arp;
+	size_t arplen;
+	uint8_t bytes[(0xf << 2) + sizeof(*ping) + sizeof(*ah) +
+	    sizeof(arp) + COMMARP_AEAD_OVERHEAD];
 	unsigned int iphlen;
 	ssize_t rv, hlen;
 
@@ -780,14 +943,53 @@ iface_ping_recv(int fd, short events, void *arg)
 		return;
 	}
 
-	arp = (struct ether_arp *)(bytes + hlen);
-	hlen += sizeof(*arp);
+	hlen += sizeof(*ah);
 	if (rv < hlen) {
-		/* iface->if_ping_arp_short++ */
+		/* iface->if_ping_short++ */
 		return;
 	}
 
-	iface_arp_reply(iface, arp);
+	ah = (struct commarp_aead_header *)(ping + 1);
+	TAILQ_FOREACH(ce, &ca->ca_epochs, ce_entry) {
+		if (ce->ce_gen == ah->gen)
+			break;
+	}
+	if (ce == NULL) {
+		/* iface->if_epoch_gen++ */
+		return;
+	}
+
+	/* XXX check nonce/seq */
+#if 0
+	if (ah->nonce[0] != htonl(0)) {
+		/* iface->if_epoch_nonce++ */
+		return;
+	}
+	seq = (uint64_t)letoh32(ah->nonce[1]) << 32 |
+	    (uint64_t)letoh32(ah->nonce[2]);
+#endif
+
+	aad.addr = ip->ip_src;
+	aad.id = ping->ping_id;
+	aad.seq = ping->ping_seq;
+
+	if (EVP_AEAD_CTX_init(&ctx, aead,
+	    (void *)ce->ce_key, sizeof(ce->ce_key),
+	    COMMARP_AEAD_OVERHEAD, NULL) != 1)
+		lerrx(1, "EVP init error");
+
+	if (EVP_AEAD_CTX_open(&ctx,
+	    (void *)&arp, &arplen, sizeof(arp),
+	    (void *)ah->nonce, sizeof(ah->nonce),
+	    (void *)(bytes + hlen), rv - hlen,
+	    (void *)&aad, sizeof(aad)) != 1) {
+		/* iface->if_open++ */
+		return;
+	}
+
+	EVP_AEAD_CTX_cleanup(&ctx);
+
+	iface_arp_reply(iface, &arp);
 }
 
 void
