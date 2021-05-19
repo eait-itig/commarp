@@ -11,7 +11,3 @@ clients with it's own l2 address, which in turn directs all IPv4
 communication to the router for... routing.
 
 This has been written to run on OpenBSD.
-
-## Todo
-
-- Strengthen the ICMP payload
