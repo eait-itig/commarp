@@ -19,7 +19,7 @@ isolation enabled. Router R running `commarp` supports this as
 follows:
 
 1. Host A broadcasts an ARP request for host B to the network
-2. `commarp` on router A receives the ARP requests
+2. `commarp` on router R receives the ARP requests
 3. `commarp` encapsulates the ARP request in an ICMP ping packet
    and sends it to host B
 4. Host B echos the ping packet back to router R
