@@ -564,10 +564,13 @@ arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 
 	filter = iface->if_filters;
 	if (filter) {
-		struct commarp_address caddr;
+		struct commarp_address spa;
+		struct commarp_address tpa;
 
-		commarp_bytes_to_address(&caddr, arp->arp_tpa);
-		if (commarp_filter(filter, caddr)) {
+		commarp_bytes_to_address(&spa, arp->arp_spa);
+		commarp_bytes_to_address(&tpa, arp->arp_tpa);
+		if (commarp_filter(filter, spa) ||
+		    commarp_filter(filter, tpa)) {
 			iface->if_arp_filtered++;
 			return;
 		}
