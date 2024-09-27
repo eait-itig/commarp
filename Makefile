@@ -8,8 +8,8 @@ SRCS+=	log.c
 YFLAGS=
 MAN=
 
-LDADD=  -levent
-DPADD=  ${LIBEVENT}
+LDADD=  -levent -lcrypto
+DPADD=  ${LIBEVENT} ${LIBCRYPTO}
 
 WARNINGS=Yes
 DEBUG=-g
