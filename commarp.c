@@ -211,7 +211,6 @@ int verbose = 0;
 static const struct timeval commarp_epoch_tv = { 3600, 0 };
 static const struct timespec commarp_epoch_age = { 7201, 0 };
 #define commarp_epoch_maxnonce 0xfffffffffffff
-static const EVP_AEAD *aead;
 static int debug = 0;
 
 int
@@ -232,16 +231,16 @@ main(int argc, char *argv[])
 	struct passwd *pw;
 	int devnull = -1;
 
-	aead = EVP_aead_chacha20_poly1305();
+	ca->ca_aead = EVP_aead_chacha20_poly1305();
 
 	assert(sizeof_member(commarp_epoch, ce_key) ==
-	    EVP_AEAD_key_length(aead));
+	    EVP_AEAD_key_length(ca->ca_aead));
 	/* avoid reuse */
 	assert(sizeof_member(commarp_epoch, ce_nonce) <=
-	    EVP_AEAD_nonce_length(aead));
+	    EVP_AEAD_nonce_length(ca->ca_aead));
 	assert(sizeof_member(commarp_aead_header, nonce) ==
-	    EVP_AEAD_nonce_length(aead));
-	assert(COMMARP_AEAD_OVERHEAD == EVP_AEAD_max_overhead(aead));
+	    EVP_AEAD_nonce_length(ca->ca_aead));
+	assert(COMMARP_AEAD_OVERHEAD == EVP_AEAD_max_overhead(ca->ca_aead));
 
 	while ((ch = getopt(argc, argv, "df:u:v")) != -1) {
 		switch (ch) {
@@ -706,7 +705,7 @@ arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 	aad.id = iface->if_ca->ca_ping_ident;
 	aad.seq = htons(iface->if_ping_seq++);
 
-	if (EVP_AEAD_CTX_init(&ctx, aead,
+	if (EVP_AEAD_CTX_init(&ctx, ca->ca_aead,
 	    (void *)ce->ce_key, sizeof(ce->ce_key),
 	    COMMARP_AEAD_OVERHEAD, NULL) != 1)
 		lerrx(1, "EVP init error");
@@ -976,7 +975,7 @@ iface_ping_recv(int fd, short events, void *arg)
 	aad.id = ping->ping_id;
 	aad.seq = ping->ping_seq;
 
-	if (EVP_AEAD_CTX_init(&ctx, aead,
+	if (EVP_AEAD_CTX_init(&ctx, ca->ca_aead,
 	    (void *)ce->ce_key, sizeof(ce->ce_key),
 	    COMMARP_AEAD_OVERHEAD, NULL) != 1)
 		lerrx(1, "EVP init error");
