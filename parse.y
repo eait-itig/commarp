@@ -108,7 +108,6 @@ static struct ifaddrs		*ca_ifas;
 %token	<v.string>		STRING
 %token	<v.number>		NUMBER
 %type	<v.i>			filter
-%type	<v.string>		port
 %type	<v.address>		address
 %type	<v.addressrange>	addressrange
 %type	<v.filter>		addressfilters addressfilter interfaceopts
