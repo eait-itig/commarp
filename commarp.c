@@ -160,6 +160,7 @@ struct commarp_iface {
 	uint64_t		 if_bpf_fail;
 	uint64_t		 if_arp_inval;
 	uint64_t		 if_arp_filtered;
+	uint64_t		 if_aead_nomem;
 };
 
 struct commarp {
@@ -394,10 +395,10 @@ commarp_siginfo(int sig, short events, void *arg)
 
 	TAILQ_FOREACH(iface, &ca->ca_ifaces, if_entry) {
 		linfo("iface:%s bpf_reads:%llu packets:%llu bpf_short:%llu "
-		    "ether_short:%llu arp_short:%llu",
+		    "ether_short:%llu arp_short:%llu aead_enomem:%llu",
 		    iface->if_name, iface->if_bpf_reads, iface->if_packets,
 		    iface->if_bpf_short, iface->if_ether_short,
-		    iface->if_arp_short);
+		    iface->if_arp_short, iface->if_aead_nomem);
 	}
 }
 
@@ -622,7 +623,7 @@ arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 	uint8_t out[sizeof(*arp) + COMMARP_AEAD_OVERHEAD];
 	size_t outlen;
 	struct commarp_epoch *ce;
-	EVP_AEAD_CTX ctx;
+	EVP_AEAD_CTX *ctx;
 	uint64_t nonce;
 
 	struct commarp_address_filter *filter;
@@ -705,19 +706,25 @@ arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 	aad.id = iface->if_ca->ca_ping_ident;
 	aad.seq = htons(iface->if_ping_seq++);
 
-	if (EVP_AEAD_CTX_init(&ctx, ca->ca_aead,
+	ctx = EVP_AEAD_CTX_new();
+	if (ctx == NULL) {
+		iface->if_aead_nomem++;
+		return;
+	}
+
+	if (EVP_AEAD_CTX_init(ctx, ca->ca_aead,
 	    (void *)ce->ce_key, sizeof(ce->ce_key),
 	    COMMARP_AEAD_OVERHEAD, NULL) != 1)
 		lerrx(1, "EVP init error");
 
-	if (EVP_AEAD_CTX_seal(&ctx,
+	if (EVP_AEAD_CTX_seal(ctx,
 	    out, &outlen, sizeof(out),
 	    (void *)ah.nonce, sizeof(ah.nonce),
 	    (void *)arp, sizeof(*arp),
 	    (void *)&aad, sizeof(aad)) != 1)
 		lerrx(1, "EVP seal error");
 
-	EVP_AEAD_CTX_cleanup(&ctx);
+	EVP_AEAD_CTX_free(ctx);
 
 	memset(&ping, 0, sizeof(ping));
 	ping.ping_type = ICMP_ECHO;
@@ -903,13 +910,14 @@ iface_ping_recv(int fd, short events, void *arg)
 	struct ping_hdr *ping;
 	struct commarp_aead_header *ah;
 	struct commarp_aead_aad aad;
-	EVP_AEAD_CTX ctx;
+	EVP_AEAD_CTX *ctx;
 	struct ether_arp arp;
 	size_t arplen;
 	uint8_t bytes[(0xf << 2) + sizeof(*ping) + sizeof(*ah) +
 	    sizeof(arp) + COMMARP_AEAD_OVERHEAD];
 	unsigned int iphlen;
 	ssize_t rv, hlen;
+	int isopen;
 
 	rv = recvfrom(fd, bytes, sizeof(bytes), 0,
 	    (struct sockaddr *)&sin, &sinlen);
@@ -975,21 +983,29 @@ iface_ping_recv(int fd, short events, void *arg)
 	aad.id = ping->ping_id;
 	aad.seq = ping->ping_seq;
 
-	if (EVP_AEAD_CTX_init(&ctx, ca->ca_aead,
+	ctx = EVP_AEAD_CTX_new();
+	if (ctx == NULL) {
+		iface->if_aead_nomem++;
+		return;
+	}
+
+	if (EVP_AEAD_CTX_init(ctx, ca->ca_aead,
 	    (void *)ce->ce_key, sizeof(ce->ce_key),
 	    COMMARP_AEAD_OVERHEAD, NULL) != 1)
 		lerrx(1, "EVP init error");
 
-	if (EVP_AEAD_CTX_open(&ctx,
+	isopen = EVP_AEAD_CTX_open(ctx,
 	    (void *)&arp, &arplen, sizeof(arp),
 	    (void *)ah->nonce, sizeof(ah->nonce),
 	    (void *)(bytes + hlen), rv - hlen,
-	    (void *)&aad, sizeof(aad)) != 1) {
+	    (void *)&aad, sizeof(aad));
+
+	EVP_AEAD_CTX_free(ctx);
+
+	if (isopen != 1) {
 		/* iface->if_open++ */
 		return;
 	}
-
-	EVP_AEAD_CTX_cleanup(&ctx);
 
 	iface_arp_reply(iface, &arp);
 }
