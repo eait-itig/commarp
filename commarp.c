@@ -160,6 +160,7 @@ struct commarp_iface {
 	uint64_t		 if_bpf_fail;
 	uint64_t		 if_arp_inval;
 	uint64_t		 if_arp_filtered;
+	uint64_t		 if_arp_dad;
 	uint64_t		 if_aead_nomem;
 };
 
@@ -395,10 +396,12 @@ commarp_siginfo(int sig, short events, void *arg)
 
 	TAILQ_FOREACH(iface, &ca->ca_ifaces, if_entry) {
 		linfo("iface:%s bpf_reads:%llu packets:%llu bpf_short:%llu "
-		    "ether_short:%llu arp_short:%llu aead_enomem:%llu",
+		    "ether_short:%llu arp_short:%llu arp_dad:%llu "
+		    "aead_enomem:%llu",
 		    iface->if_name, iface->if_bpf_reads, iface->if_packets,
 		    iface->if_bpf_short, iface->if_ether_short,
-		    iface->if_arp_short, iface->if_aead_nomem);
+		    iface->if_arp_short, iface->if_arp_dad,
+		    iface->if_aead_nomem);
 	}
 }
 
@@ -616,6 +619,8 @@ arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 	struct commarp *ca = iface->if_ca;
 	struct ether_arp_pkt *eap;
 	struct ether_arp *arp;
+	struct commarp_address spa;
+	struct commarp_address tpa;
 	struct ping_hdr ping;
 	uint32_t cksum;
 	struct commarp_aead_header ah;
@@ -676,13 +681,15 @@ arp_pkt_input(struct commarp_iface *iface, void *pkt, size_t len)
 		return;
 	}
 
+	commarp_bytes_to_address(&spa, arp->arp_spa);
+	commarp_bytes_to_address(&tpa, arp->arp_tpa);
+	if (spa.addr == tpa.addr) {
+		iface->if_arp_dad++;
+		return;
+	}
+
 	filter = iface->if_filters;
 	if (filter) {
-		struct commarp_address spa;
-		struct commarp_address tpa;
-
-		commarp_bytes_to_address(&spa, arp->arp_spa);
-		commarp_bytes_to_address(&tpa, arp->arp_tpa);
 		if (commarp_filter(filter, spa) ||
 		    commarp_filter(filter, tpa)) {
 			iface->if_arp_filtered++;
